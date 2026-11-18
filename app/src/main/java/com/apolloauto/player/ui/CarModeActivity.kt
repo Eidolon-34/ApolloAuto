@@ -1,0 +1,1157 @@
+package com.apolloauto.player.ui
+
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Bundle
+import androidx.activity.compose.BackHandler
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Favorite
+import androidx.compose.material.icons.filled.FavoriteBorder
+import androidx.compose.material.icons.filled.KeyboardArrowLeft
+import androidx.compose.material.icons.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Layers
+import androidx.compose.material.icons.filled.Pause
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.PlaylistAdd
+import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.RepeatOne
+import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
+import androidx.compose.material.icons.filled.Tune
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import coil.compose.AsyncImage
+import com.apolloauto.player.ApolloApp
+import com.apolloauto.player.data.FolderIdentity
+import com.apolloauto.player.data.folderIdentity
+import com.apolloauto.player.data.Playlist
+import com.apolloauto.player.data.MusicSource
+import com.apolloauto.player.data.PlaylistStore
+import com.apolloauto.player.data.Track
+import com.apolloauto.player.data.TrackMetadataFormatter
+import com.apolloauto.player.data.displayArtist
+import com.apolloauto.player.data.displayTitle
+import com.apolloauto.player.media.PlayerController
+import com.apolloauto.player.media.QueueEntry
+import com.apolloauto.player.media.RepeatModeUi
+import com.apolloauto.player.theme.ApolloCyberTheme
+import com.apolloauto.player.theme.ApolloSpace
+import com.apolloauto.player.theme.LocalBodyFont
+import com.apolloauto.player.theme.LocalHudFont
+import com.apolloauto.player.theme.LocalHudPalette
+import com.apolloauto.player.ui.components.ApolloArtPlaceholder
+import com.apolloauto.player.ui.components.ArtworkThumb
+import com.apolloauto.player.ui.hud.ApolloArtworkFrame
+import com.apolloauto.player.ui.hud.ApolloHudProgress
+import com.apolloauto.player.ui.hud.useKenneyChrome
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+
+private enum class CarListMode { CAR_FAVORITES, ALL, QUEUE, FOLDERS, PLAYLISTS }
+private enum class CarDeckMode { STANDARD, VISUALIZER }
+
+class CarModeActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContent {
+            ApolloCyberTheme {
+                CarDeckScreen(onExit = { finish() })
+            }
+        }
+    }
+}
+
+@Composable
+private fun CarDeckScreen(onExit: () -> Unit) {
+    val context = LocalContext.current
+    val app = ApolloApp.instance
+    val p = LocalHudPalette.current
+    val body = LocalBodyFont.current
+    val hud = LocalHudFont.current
+    val tracks by app.libraryStore.tracks.collectAsState()
+    val playlists by app.playlistStore.playlists.collectAsState()
+    val librarySources by app.musicSourceStore.sources.collectAsState()
+    val source by app.libraryStore.source.collectAsState()
+    val status by app.libraryStore.status.collectAsState()
+    val controller = remember { PlayerController(context.applicationContext) }
+    val playback by controller.state.collectAsState()
+    var listMode by remember { mutableStateOf(CarListMode.CAR_FAVORITES) }
+    var addSheet by remember { mutableStateOf(false) }
+    // Visualizer-first Car Mode: list collapsed; full HUD available via toggle.
+    var panelExpanded by remember { mutableStateOf(false) }
+    var deckMode by remember { mutableStateOf(CarDeckMode.VISUALIZER) }
+
+    val carTracks = remember(tracks, playlists) {
+        app.playlistStore.resolveById(PlaylistStore.CAR_FAVORITES_ID, tracks)
+    }
+    val queueEntries = playback.queue
+    val listTracks = when (listMode) {
+        CarListMode.CAR_FAVORITES -> carTracks
+        CarListMode.ALL, CarListMode.FOLDERS, CarListMode.PLAYLISTS -> tracks
+        CarListMode.QUEUE -> emptyList()
+    }
+    val inCar = remember(playback.mediaId, playlists) {
+        playback.mediaId.isNotBlank() && app.playlistStore.isInCarFavorites(playback.mediaId)
+    }
+    val progress = if (playback.durationMs > 0) {
+        (playback.positionMs.toFloat() / playback.durationMs).coerceIn(0f, 1f)
+    } else 0f
+    val metaLines = TrackMetadataFormatter.displayLines(playback.title, playback.artist, playback.album)
+    val vizMode by app.visualizerController.mode.collectAsState()
+    val enabledVizModes by app.themeStore.enabledVisualizerModes.collectAsState()
+    val driveMode by app.themeStore.driveMode.collectAsState()
+    val companionLine by app.themeStore.companionLine.collectAsState()
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    val lifecycleState by lifecycle.currentStateFlow.collectAsState()
+    val surfaceResumed = lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
+    val view = androidx.compose.ui.platform.LocalView.current
+
+    DisposableEffect(driveMode) {
+        val window = (view.context as? android.app.Activity)?.window
+        if (driveMode) {
+            window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    val micPermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (granted && lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) && controller.state.value.playing) {
+            val session = app.playbackBridge?.audioSessionId() ?: 0
+            if (session != 0) app.visualizerController.attach(session)
+            app.visualizerController.setEnabled(true)
+        }
+    }
+
+    DisposableEffect(Unit) {
+        app.playlistStore.ensureCarFavorites()
+        controller.connect()
+        onDispose {
+            // Do not soft-pause a newly resumed activity sharing this controller.
+            if (lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)) {
+                app.visualizerController.setEnabled(false)
+            }
+            controller.release()
+        }
+    }
+
+    LaunchedEffect(surfaceResumed) {
+        if (!surfaceResumed) return@LaunchedEffect
+        while (isActive) {
+            controller.pollPosition()
+            delay(350)
+        }
+    }
+
+    LaunchedEffect(playback.playing, surfaceResumed) {
+        // Reacquire on return from Immersive, even if playback never changed.
+        // Background activities must not override the foreground capture owner.
+        if (!surfaceResumed) return@LaunchedEffect
+        if (playback.playing) {
+            val granted = ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO
+            ) == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                val session = app.playbackBridge?.audioSessionId() ?: 0
+                if (session != 0) app.visualizerController.attach(session)
+                app.visualizerController.setEnabled(true)
+            } else {
+                micPermission.launch(Manifest.permission.RECORD_AUDIO)
+            }
+        } else {
+            app.visualizerController.setEnabled(false)
+        }
+    }
+
+    CyberBackground {
+        Box(Modifier.fillMaxSize()) {
+            GlitchHudOverlay(Modifier.fillMaxSize())
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+                    .padding(ApolloSpace.space12)
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("APOLLO II", color = p.primary, fontFamily = hud, fontSize = 18.sp, letterSpacing = 1.sp)
+                        Text(" // CAR", color = p.secondary, fontFamily = body, fontSize = 13.sp)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            source.name,
+                            color = p.soft,
+                            fontFamily = body,
+                            fontSize = 10.sp,
+                            modifier = Modifier
+                                .border(1.dp, p.accent.copy(alpha = 0.55f), RoundedCornerShape(3.dp))
+                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                        )
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        ModeToggleChip(
+                            label = if (driveMode) "DRIVE ON" else "DRIVE",
+                            selected = driveMode
+                        ) {
+                            val on = app.themeStore.toggleDriveMode()
+                            app.themeStore.speak(
+                                if (on) com.apolloauto.player.companion.CompanionVoice.driveOnLine()
+                                else com.apolloauto.player.companion.CompanionVoice.driveOffLine()
+                            )
+                        }
+                        ModeToggleChip(
+                            label = if (deckMode == CarDeckMode.VISUALIZER) "VIZ ONLY" else "FULL HUD",
+                            selected = deckMode == CarDeckMode.VISUALIZER
+                        ) {
+                            deckMode = if (deckMode == CarDeckMode.VISUALIZER) {
+                                CarDeckMode.STANDARD
+                            } else {
+                                CarDeckMode.VISUALIZER
+                            }
+                        }
+                        ModeToggleChip(
+                            label = "IMMERSIVE",
+                            selected = false
+                        ) {
+                            context.startActivity(Intent(context, ImmersiveVisualizerActivity::class.java))
+                        }
+                        ModeToggleChip(
+                            label = if (panelExpanded && deckMode == CarDeckMode.STANDARD) "HIDE LIST" else "BROWSE",
+                            selected = panelExpanded && deckMode == CarDeckMode.STANDARD
+                        ) {
+                            val showing = panelExpanded && deckMode == CarDeckMode.STANDARD
+                            deckMode = CarDeckMode.STANDARD
+                            panelExpanded = !showing
+                        }
+                        Text(
+                            "EXIT",
+                            color = p.dim,
+                            fontFamily = body,
+                            modifier = Modifier
+                                .border(1.dp, p.dim.copy(alpha = 0.5f), RoundedCornerShape(4.dp))
+                                .clickable(onClick = onExit)
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        )
+                    }
+                }
+
+                Text(
+                    companionLine,
+                    color = p.dim,
+                    fontFamily = body,
+                    fontSize = 11.sp,
+                    maxLines = 1
+                )
+                Spacer(Modifier.height(ApolloSpace.space8))
+
+                when (deckMode) {
+                    CarDeckMode.VISUALIZER -> {
+                        VisualizerOnlyDeck(
+                            title = metaLines.getOrElse(0) { playback.title },
+                            artist = metaLines.getOrElse(1) { playback.artist },
+                            playing = playback.playing,
+                            onPrev = controller::skipPrevious,
+                            onNext = controller::skipNext,
+                            onToggle = controller::togglePlayPause,
+                            onExit = {
+                                deckMode = CarDeckMode.STANDARD
+                            },
+                            artworkUri = playback.artworkUri,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+
+                    CarDeckMode.STANDARD -> {
+                        Row(
+                            Modifier
+                                .weight(1f)
+                                .fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(ApolloSpace.space8)
+                        ) {
+                            // Scrollable left deck so transport/play controls are never clipped
+                            // under short landscape heights.
+                            BoxWithConstraints(
+                                Modifier
+                                    .weight(1f)
+                                    .fillMaxHeight()
+                            ) {
+                                val shortLandscape = maxHeight < 360.dp
+                                val vizHeight = when {
+                                    shortLandscape -> (maxHeight * 0.38f).coerceIn(120.dp, 200.dp)
+                                    else -> (maxHeight * 0.48f).coerceIn(160.dp, 360.dp)
+                                }
+                                Column(
+                                    Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                ) {
+                                    Box(
+                                        Modifier
+                                            .fillMaxWidth()
+                                            .height(vizHeight)
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .border(1.dp, p.primary.copy(alpha = 0.4f), RoundedCornerShape(6.dp))
+                                            .background(p.voidBlack.copy(alpha = 0.55f))
+                                    ) {
+                                        val bgMode by app.themeStore.vizBackgroundMode.collectAsState()
+                                        val albumBlur by app.themeStore.albumBlur.collectAsState()
+                                        val albumDark by app.themeStore.albumDarkness.collectAsState()
+                                        val albumSat by app.themeStore.albumSaturation.collectAsState()
+                                        val sceneBgOverrides by app.themeStore.sceneBgOverrides.collectAsState()
+                                        val sceneOverride = sceneBgOverrides[vizMode]
+                                        val effectiveBg = remember(bgMode, vizMode, sceneOverride) {
+                                            com.apolloauto.player.media.VisualizerBackgroundPolicy.resolve(
+                                                bgMode, vizMode, sceneOverride
+                                            )
+                                        }
+                                        VisualizerBackgroundLayer(
+                                            effective = effectiveBg,
+                                            artworkUri = playback.artworkUri,
+                                            albumBlur = albumBlur,
+                                            albumDarkness = albumDark,
+                                            albumSaturation = albumSat,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                        ApolloVisualizerSurface(
+                                            playing = playback.playing,
+                                            clearBackdrop = true,
+                                            modifier = Modifier.fillMaxSize()
+                                        )
+                                        Canvas(Modifier.fillMaxSize()) {
+                                            val c = p.accent.copy(alpha = 0.7f)
+                                            val len = 18f
+                                            drawLine(c, Offset(8f, 8f), Offset(8f + len, 8f), 2f)
+                                            drawLine(c, Offset(8f, 8f), Offset(8f, 8f + len), 2f)
+                                            drawLine(
+                                                c,
+                                                Offset(size.width - 8f, 8f),
+                                                Offset(size.width - 8f - len, 8f),
+                                                2f
+                                            )
+                                            drawLine(
+                                                c,
+                                                Offset(size.width - 8f, 8f),
+                                                Offset(size.width - 8f, 8f + len),
+                                                2f
+                                            )
+                                        }
+                                        VisualizerModeCompactChips(
+                                            selected = vizMode,
+                                            enabledModes = enabledVizModes,
+                                            onSelect = { m ->
+                                                app.themeStore.setVisualizerMode(m)
+                                                app.visualizerController.setMode(m)
+                                            },
+                                            modifier = Modifier
+                                                .align(Alignment.TopStart)
+                                                .padding(8.dp)
+                                        )
+                                    }
+                                    Spacer(Modifier.height(ApolloSpace.space8))
+                                    CarTransportBar(
+                                        title = metaLines.getOrElse(0) { playback.title },
+                                        artist = metaLines.getOrElse(1) { playback.artist },
+                                        artworkUri = playback.artworkUri,
+                                        playing = playback.playing,
+                                        shuffle = playback.shuffle,
+                                        repeatMode = playback.repeatMode,
+                                        progress = progress,
+                                        position = playback.positionMs,
+                                        duration = playback.durationMs,
+                                        inCar = inCar,
+                                        compact = shortLandscape,
+                                        onPrev = controller::skipPrevious,
+                                        onToggle = controller::togglePlayPause,
+                                        onNext = controller::skipNext,
+                                        onShuffle = controller::toggleShuffle,
+                                        onRemix = controller::remixShuffle,
+                                        onRepeat = controller::cycleRepeat,
+                                        onHeart = {
+                                            if (playback.mediaId.isNotBlank()) {
+                                                app.playlistStore.toggleCarFavorite(playback.mediaId)
+                                            }
+                                        },
+                                        onAdd = { if (playback.mediaId.isNotBlank()) addSheet = true }
+                                    )
+                                    if (status.isNotBlank()) {
+                                        Text(
+                                            status,
+                                            color = p.dim,
+                                            fontFamily = body,
+                                            fontSize = 11.sp,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                            modifier = Modifier.padding(top = 4.dp)
+                                        )
+                                    }
+                                    // Scroll slack so the play row clears the nav gesture bar.
+                                    Spacer(Modifier.height(12.dp))
+                                }
+                            }
+
+                            AnimatedVisibility(
+                                visible = panelExpanded,
+                                enter = expandHorizontally(expandFrom = Alignment.End) + fadeIn(),
+                                exit = shrinkHorizontally(shrinkTowards = Alignment.End) + fadeOut()
+                            ) {
+                                CarBrowsePanel(
+                                    listMode = listMode,
+                                    carCount = carTracks.size,
+                                    allCount = tracks.size,
+                                    queueCount = queueEntries.size,
+                                    listTracks = listTracks,
+                                    playlists = playlists,
+                                    sources = librarySources,
+                                    queueEntries = queueEntries,
+                                    playingId = playback.mediaId,
+                                    playlistStore = app.playlistStore,
+                                    modifier = Modifier
+                                        .width(300.dp)
+                                        .fillMaxHeight(),
+                                    onMode = { listMode = it },
+                                    onPlay = { list, index -> controller.playTracks(list, index) },
+                                    onPlayQueueIndex = controller::seekToQueueIndex,
+                                    onToggleCar = { app.playlistStore.toggleCarFavorite(it) }
+                                )
+                            }
+
+                            if (!panelExpanded) {
+                                Box(
+                                    Modifier
+                                        .width(36.dp)
+                                        .fillMaxHeight()
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .border(1.dp, p.primary.copy(alpha = 0.4f), RoundedCornerShape(4.dp))
+                                        .background(p.panel.copy(alpha = 0.8f))
+                                        .clickable { panelExpanded = true },
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(Icons.Default.KeyboardArrowLeft, "Expand list", tint = p.primary)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (addSheet && playback.mediaId.isNotBlank()) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(p.voidBlack.copy(alpha = 0.55f))
+                        .clickable { addSheet = false },
+                    contentAlignment = Alignment.BottomCenter
+                ) {
+                    Box(Modifier.clickable(enabled = false) {}) {
+                        AddToPlaylistSheet(
+                            trackId = playback.mediaId,
+                            trackTitle = playback.title,
+                            playlists = playlists,
+                            playlistStore = app.playlistStore,
+                            onDismiss = { addSheet = false }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun VisualizerOnlyDeck(
+    title: String,
+    artist: String,
+    playing: Boolean,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onToggle: () -> Unit,
+    onExit: (() -> Unit)? = null,
+    artworkUri: android.net.Uri? = null,
+    modifier: Modifier = Modifier
+) {
+    val p = LocalHudPalette.current
+    val body = LocalBodyFont.current
+    val app = ApolloApp.instance
+    val vizMode by app.visualizerController.mode.collectAsState()
+    val enabledVizModes by app.themeStore.enabledVisualizerModes.collectAsState()
+    val bgMode by app.themeStore.vizBackgroundMode.collectAsState()
+    val albumBlur by app.themeStore.albumBlur.collectAsState()
+    val albumDark by app.themeStore.albumDarkness.collectAsState()
+    val albumSat by app.themeStore.albumSaturation.collectAsState()
+    val sceneBgOverrides by app.themeStore.sceneBgOverrides.collectAsState()
+    val sceneOverride = sceneBgOverrides[vizMode]
+    val effectiveBg = remember(bgMode, vizMode, sceneOverride) {
+        com.apolloauto.player.media.VisualizerBackgroundPolicy.resolve(bgMode, vizMode, sceneOverride)
+    }
+    // Start with chrome visible briefly so users discover controls, then auto-hide.
+    var chromeVisible by remember { mutableStateOf(true) }
+    var showBgSheet by remember { mutableStateOf(false) }
+    var idleTick by remember { mutableStateOf(0) }
+
+    LaunchedEffect(chromeVisible, idleTick, showBgSheet) {
+        if (!chromeVisible || showBgSheet) return@LaunchedEffect
+        delay(3_500)
+        if (isActive) chromeVisible = false
+    }
+
+    Box(
+        modifier
+            .fillMaxSize()
+            .clip(RoundedCornerShape(6.dp))
+            .border(1.dp, p.primary.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
+            .background(Color.Black)
+            .clickable(
+                indication = null,
+                interactionSource = remember { MutableInteractionSource() }
+            ) {
+                chromeVisible = !chromeVisible
+                showBgSheet = false
+                idleTick++
+            }
+    ) {
+        VisualizerBackgroundLayer(
+            effective = effectiveBg,
+            artworkUri = artworkUri,
+            albumBlur = albumBlur,
+            albumDarkness = albumDark,
+            albumSaturation = albumSat,
+            modifier = Modifier.fillMaxSize()
+        )
+        ApolloVisualizerSurface(
+            playing = playing,
+            clearBackdrop = true,
+            modifier = Modifier.fillMaxSize()
+        )
+        if (chromeVisible) {
+            Row(
+                Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = {
+                        showBgSheet = !showBgSheet
+                        idleTick++
+                    },
+                    modifier = Modifier.size(44.dp)
+                ) {
+                    Icon(
+                        Icons.Default.Layers,
+                        contentDescription = "Visual background",
+                        tint = if (showBgSheet) p.accent else p.soft.copy(alpha = 0.7f)
+                    )
+                }
+                if (onExit != null) {
+                    IconButton(onClick = onExit, modifier = Modifier.size(44.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "Exit viz-only", tint = p.dim)
+                    }
+                }
+            }
+            VisualizerModeCompactChips(
+                selected = vizMode,
+                enabledModes = enabledVizModes,
+                onSelect = { m ->
+                    app.themeStore.setVisualizerMode(m)
+                    app.visualizerController.setMode(m)
+                    idleTick++
+                },
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .padding(top = 48.dp, start = 10.dp, end = 10.dp)
+            )
+            if (showBgSheet) {
+                VisualBackgroundSheet(
+                    scene = vizMode,
+                    onClose = { showBgSheet = false },
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .fillMaxWidth(0.92f)
+                        .padding(12.dp)
+                )
+            }
+            Box(
+                Modifier
+                    .align(Alignment.Center)
+                    .size(72.dp)
+                    .clip(CircleShape)
+                    .border(1.dp, p.accent.copy(alpha = 0.5f), CircleShape)
+                    .background(p.voidBlack.copy(alpha = 0.35f))
+                    .clickable {
+                        onToggle()
+                        idleTick++
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    if (playing) "Pause" else "Play",
+                    tint = p.soft,
+                    modifier = Modifier.size(36.dp)
+                )
+            }
+            Column(
+                Modifier
+                    .align(Alignment.BottomCenter)
+                    .fillMaxWidth()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, p.voidBlack.copy(alpha = 0.85f))
+                        )
+                    )
+                    .padding(horizontal = 12.dp, vertical = 14.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Row(
+                    Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    IconButton(
+                        onClick = {
+                            onPrev()
+                            idleTick++
+                        },
+                        modifier = Modifier.size(52.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.SkipPrevious,
+                            "Previous",
+                            tint = p.primary,
+                            modifier = Modifier.size(36.dp)
+                        )
+                    }
+                    Column(
+                        Modifier.weight(1f),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            title,
+                            color = p.soft,
+                            fontFamily = body,
+                            fontSize = 16.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center
+                        )
+                        Text(
+                            artist,
+                            color = p.dim,
+                            fontFamily = body,
+                            fontSize = 13.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            onNext()
+                            idleTick++
+                        },
+                        modifier = Modifier.size(52.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.SkipNext,
+                            "Next",
+                            tint = p.primary,
+                            modifier = Modifier.size(36.dp)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CarTransportBar(
+    title: String,
+    artist: String,
+    artworkUri: android.net.Uri?,
+    playing: Boolean,
+    shuffle: Boolean,
+    repeatMode: RepeatModeUi,
+    progress: Float,
+    position: Long,
+    duration: Long,
+    inCar: Boolean,
+    compact: Boolean = false,
+    onPrev: () -> Unit,
+    onToggle: () -> Unit,
+    onNext: () -> Unit,
+    onShuffle: () -> Unit,
+    onRemix: () -> Unit,
+    onRepeat: () -> Unit,
+    onHeart: () -> Unit,
+    onAdd: () -> Unit
+) {
+    val p = LocalHudPalette.current
+    val body = LocalBodyFont.current
+    val heartScale by animateFloatAsState(if (inCar) 1.12f else 1f, label = "heart")
+    val artSize = if (compact) 44.dp else 56.dp
+    val pad = if (compact) 8.dp else 10.dp
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(6.dp))
+            .border(1.dp, p.primary.copy(alpha = 0.35f), RoundedCornerShape(6.dp))
+            .background(p.panel.copy(alpha = 0.88f))
+            .padding(pad)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            ApolloArtworkFrame(Modifier.size(artSize)) {
+                if (artworkUri != null) {
+                    AsyncImage(
+                        model = artworkUri,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier.fillMaxSize()
+                    )
+                } else {
+                    ApolloArtPlaceholder(Modifier.fillMaxSize())
+                }
+            }
+            Spacer(Modifier.width(6.dp))
+            IconButton(onClick = onPrev, modifier = Modifier.size(ApolloSpace.touchMin)) {
+                Icon(Icons.Default.SkipPrevious, "Previous", tint = p.primary, modifier = Modifier.size(28.dp))
+            }
+            Column(Modifier.weight(1f)) {
+                Text(title, color = p.soft, fontFamily = body, fontSize = 16.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(artist, color = p.dim, fontFamily = body, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Spacer(Modifier.height(4.dp))
+                ApolloHudProgress(progress, height = 8.dp)
+                Text(
+                    "${fmt(position)} / ${fmt(duration)}",
+                    color = p.dim,
+                    fontFamily = body,
+                    fontSize = 11.sp
+                )
+            }
+            IconButton(onClick = onNext, modifier = Modifier.size(ApolloSpace.touchMin)) {
+                Icon(Icons.Default.SkipNext, "Next", tint = p.primary, modifier = Modifier.size(28.dp))
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onShuffle, modifier = Modifier.size(ApolloSpace.touchMin)) {
+                Icon(
+                    Icons.Default.Shuffle,
+                    if (shuffle) "Shuffle on" else "Shuffle off",
+                    tint = if (shuffle) p.accent else p.dim
+                )
+            }
+            IconButton(
+                onClick = onRemix,
+                enabled = shuffle,
+                modifier = Modifier.size(ApolloSpace.touchMin)
+            ) {
+                Icon(
+                    Icons.Default.Tune,
+                    "Remix shuffle",
+                    tint = if (shuffle) p.secondary else p.dim.copy(alpha = 0.35f)
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .clip(CircleShape)
+                    .background(Brush.radialGradient(listOf(p.accent.copy(alpha = 0.4f), p.panel)))
+                    .border(2.dp, p.accent, CircleShape)
+                    .clickable(onClick = onToggle),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    if (playing) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    if (playing) "Pause" else "Play",
+                    tint = p.soft,
+                    modifier = Modifier.size(30.dp)
+                )
+            }
+            IconButton(onClick = onRepeat, modifier = Modifier.size(ApolloSpace.touchMin)) {
+                Icon(
+                    if (repeatMode == RepeatModeUi.ONE) Icons.Default.RepeatOne else Icons.Default.Repeat,
+                    "Repeat",
+                    tint = if (repeatMode == RepeatModeUi.OFF) p.dim else p.secondary
+                )
+            }
+            IconButton(onClick = onHeart, modifier = Modifier.size(ApolloSpace.touchMin)) {
+                Icon(
+                    if (inCar) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                    if (inCar) "Remove from Car Favorites" else "Add to Car Favorites",
+                    tint = if (inCar) p.accent else p.dim,
+                    modifier = Modifier.size((22 * heartScale).dp)
+                )
+            }
+            IconButton(onClick = onAdd, modifier = Modifier.size(ApolloSpace.touchMin)) {
+                Icon(Icons.Default.PlaylistAdd, "Add to playlist", tint = p.primary)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CarBrowsePanel(
+    listMode: CarListMode,
+    carCount: Int,
+    allCount: Int,
+    queueCount: Int,
+    listTracks: List<Track>,
+    playlists: List<Playlist>,
+    sources: List<MusicSource>,
+    queueEntries: List<QueueEntry>,
+    playingId: String,
+    playlistStore: PlaylistStore,
+    onMode: (CarListMode) -> Unit,
+    onPlay: (List<Track>, Int) -> Unit,
+    onPlayQueueIndex: (Int) -> Unit,
+    onToggleCar: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val p = LocalHudPalette.current
+    val body = LocalBodyFont.current
+    var selectedFolder by remember { mutableStateOf<FolderIdentity?>(null) }
+    var includeSubfolders by remember { mutableStateOf(false) }
+    var selectedPlaylist by remember { mutableStateOf<String?>(null) }
+    BackHandler(enabled = (listMode == CarListMode.FOLDERS && selectedFolder != null) ||
+        (listMode == CarListMode.PLAYLISTS && selectedPlaylist != null)) {
+        selectedFolder = null
+        selectedPlaylist = null
+    }
+    val folderGroups = remember(listTracks) { listTracks.groupBy { it.folderIdentity() } }
+    val folders = remember(folderGroups) {
+        folderGroups.keys.flatMap { it.ancestors() }.distinct()
+            .sortedWith(compareBy({ it.sourceId }, { it.path }))
+    }
+    val displayedTracks = remember(listTracks, listMode, selectedFolder, includeSubfolders, selectedPlaylist, playlists) {
+        when (listMode) {
+            CarListMode.FOLDERS -> selectedFolder?.let { folder ->
+                listTracks.filter { folder.contains(it.folderIdentity(), includeSubfolders) }
+            } ?: emptyList()
+            CarListMode.PLAYLISTS -> selectedPlaylist?.let { playlistStore.resolveById(it, listTracks) } ?: emptyList()
+            else -> listTracks
+        }
+    }
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(ApolloSpace.corner))
+            .border(1.dp, p.primary.copy(alpha = 0.4f), RoundedCornerShape(ApolloSpace.corner))
+            .background(p.panel.copy(alpha = 0.82f))
+            .padding(ApolloSpace.space8)
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text("BROWSER", color = p.primary, fontFamily = body, fontSize = 11.sp, letterSpacing = 1.sp)
+            Icon(Icons.Default.KeyboardArrowRight, contentDescription = null, tint = p.dim, modifier = Modifier.size(16.dp))
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            ModeChip("CAR $carCount", listMode == CarListMode.CAR_FAVORITES, Modifier.weight(1f)) {
+                onMode(CarListMode.CAR_FAVORITES)
+            }
+            ModeChip("ALL $allCount", listMode == CarListMode.ALL, Modifier.weight(1f)) {
+                onMode(CarListMode.ALL)
+            }
+            ModeChip("Q $queueCount", listMode == CarListMode.QUEUE, Modifier.weight(1f)) {
+                onMode(CarListMode.QUEUE)
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+            ModeChip("FOLDERS", listMode == CarListMode.FOLDERS, Modifier.weight(1f)) {
+                selectedFolder = null
+                onMode(CarListMode.FOLDERS)
+            }
+            ModeChip("PLAYLISTS", listMode == CarListMode.PLAYLISTS, Modifier.weight(1f)) {
+                selectedPlaylist = null
+                onMode(CarListMode.PLAYLISTS)
+            }
+        }
+        Spacer(Modifier.height(6.dp))
+        if (listMode == CarListMode.FOLDERS && selectedFolder == null) {
+            LazyColumn(Modifier.weight(1f)) {
+                items(folders) { folder ->
+                    val source = sources.find { it.id == folder.sourceId }?.label ?: "Music"
+                    Text("$source / ${folder.path.ifEmpty { "Root" }}", color = p.soft, fontFamily = body,
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            selectedFolder = folder
+                            includeSubfolders = folderGroups[folder].isNullOrEmpty()
+                        }.padding(vertical = 14.dp, horizontal = 6.dp))
+                }
+                if (folders.isEmpty()) item { Text("No folders scanned yet.", color = p.dim) }
+            }
+        } else if (listMode == CarListMode.PLAYLISTS && selectedPlaylist == null) {
+            LazyColumn(Modifier.weight(1f)) {
+                items(playlists, key = { it.id }) { playlist ->
+                    Text(playlist.name, color = p.soft, fontFamily = body,
+                        modifier = Modifier.fillMaxWidth().clickable { selectedPlaylist = playlist.id }
+                            .padding(vertical = 14.dp, horizontal = 6.dp))
+                }
+                if (playlists.isEmpty()) item { Text("No saved playlists yet.", color = p.dim) }
+            }
+        } else {
+            if (listMode == CarListMode.FOLDERS || listMode == CarListMode.PLAYLISTS) {
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    ModeChip("BACK", false, Modifier.weight(1f)) { selectedFolder = null; selectedPlaylist = null }
+                    if (listMode == CarListMode.FOLDERS) {
+                        ModeChip("SUBFOLDERS", includeSubfolders, Modifier.weight(1f)) { includeSubfolders = !includeSubfolders }
+                    }
+                    ModeChip("PLAY", false, Modifier.weight(1f)) {
+                        if (displayedTracks.isNotEmpty()) onPlay(displayedTracks, 0)
+                    }
+                }
+            }
+        when (listMode) {
+            CarListMode.QUEUE -> {
+                if (queueEntries.isEmpty()) {
+                    Text("Queue empty — play a track.", color = p.dim, fontFamily = body, fontSize = 13.sp)
+                } else {
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(3.dp), modifier = Modifier.fillMaxSize()) {
+                        itemsIndexed(queueEntries, key = { i, e -> "${e.mediaId}#$i" }) { index, entry ->
+                            val selected = entry.isCurrent || entry.mediaId == playingId
+                            val lines = TrackMetadataFormatter.displayLines(entry.title, entry.artist, entry.album)
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(if (selected) p.accent.copy(alpha = 0.14f) else Color.Transparent)
+                                    .clickable { onPlayQueueIndex(index) }
+                                    .padding(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        lines[0],
+                                        color = if (selected) p.accent else p.soft,
+                                        fontFamily = body,
+                                        fontSize = 13.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    if (lines.size > 1) {
+                                        Text(lines[1], color = p.dim, fontFamily = body, fontSize = 11.sp, maxLines = 1)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            else -> {
+                if (displayedTracks.isEmpty()) {
+                    Text(
+                        if (listMode == CarListMode.CAR_FAVORITES) "No Car Favorites yet." else "No tracks.",
+                        color = p.dim,
+                        fontFamily = body,
+                        fontSize = 13.sp
+                    )
+                } else {
+                    LazyColumn(verticalArrangement = Arrangement.spacedBy(3.dp), modifier = Modifier.fillMaxSize()) {
+                        itemsIndexed(displayedTracks, key = { index, t -> "$index:${t.id}" }) { index, track ->
+                            val selected = track.id == playingId
+                            val saved = playlistStore.isInCarFavorites(track.id)
+                            Row(
+                                Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(3.dp))
+                                    .background(if (selected) p.accent.copy(alpha = 0.12f) else Color.Transparent)
+                                    .clickable { onPlay(displayedTracks, index) }
+                                    .padding(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                ArtworkThumb(artworkUri = track.artworkUri, size = 36.dp)
+                                Spacer(Modifier.width(8.dp))
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        track.displayTitle(),
+                                        color = if (selected) p.accent else p.soft,
+                                        fontFamily = body,
+                                        fontSize = 13.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(track.displayArtist(), color = p.dim, fontFamily = body, fontSize = 11.sp, maxLines = 1)
+                                }
+                                Icon(
+                                    if (saved) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                                    null,
+                                    tint = if (saved) p.accent else p.dim,
+                                    modifier = Modifier
+                                        .size(40.dp)
+                                        .clickable { onToggleCar(track.id) }
+                                        .padding(10.dp)
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    }
+}
+
+@Composable
+private fun ModeChip(label: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val p = LocalHudPalette.current
+    val body = LocalBodyFont.current
+    val kenney = useKenneyChrome(
+        ApolloApp.instance.themeStore.interfaceStyle.collectAsState().value
+    )
+    val shape = RoundedCornerShape(if (kenney) 2.dp else 3.dp)
+    Text(
+        label,
+        color = if (selected) p.soft else p.dim,
+        fontFamily = body,
+        textAlign = TextAlign.Center,
+        fontSize = 10.sp,
+        maxLines = 1,
+        modifier = modifier
+            .clip(shape)
+            .border(
+                1.dp,
+                if (selected) p.accent else p.primary.copy(alpha = if (kenney) 0.4f else 0.25f),
+                shape
+            )
+            .background(if (selected) p.accent.copy(alpha = if (kenney) 0.22f else 0.16f) else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(vertical = 7.dp)
+    )
+}
+
+@Composable
+private fun ModeToggleChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    val p = LocalHudPalette.current
+    val body = LocalBodyFont.current
+    Text(
+        label,
+        color = if (selected) p.soft else p.dim,
+        fontFamily = body,
+        fontSize = 10.sp,
+        modifier = Modifier
+            .clip(RoundedCornerShape(3.dp))
+            .border(1.dp, if (selected) p.accent else p.dim.copy(alpha = 0.4f), RoundedCornerShape(3.dp))
+            .background(if (selected) p.accent.copy(alpha = 0.15f) else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp)
+    )
+}
+
+@Composable
+private fun GlitchHudOverlay(modifier: Modifier = Modifier) {
+    val p = LocalHudPalette.current
+    Canvas(modifier) {
+        // Sparse scanlines + noise bars for cyber HUD atmosphere (static, not flashing).
+        val step = 6f
+        var y = 0f
+        while (y < size.height) {
+            drawLine(
+                color = p.primary.copy(alpha = 0.03f),
+                start = Offset(0f, y),
+                end = Offset(size.width, y),
+                strokeWidth = 1f
+            )
+            y += step
+        }
+        drawLine(
+            color = p.accent.copy(alpha = 0.12f),
+            start = Offset(0f, size.height * 0.33f),
+            end = Offset(size.width, size.height * 0.33f),
+            strokeWidth = 1f
+        )
+    }
+}
+
+private fun fmt(ms: Long): String {
+    if (ms <= 0L) return "0:00"
+    val total = ms / 1000
+    val m = total / 60
+    val s = total % 60
+    return "%d:%02d".format(m, s)
+}

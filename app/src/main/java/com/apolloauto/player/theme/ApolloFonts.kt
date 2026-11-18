@@ -1,0 +1,50 @@
+package com.apolloauto.player.theme
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.staticCompositionLocalOf
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import com.apolloauto.player.R
+
+enum class HudFontOption(val label: String, val subtitle: String) {
+    E1D1C_TEXT("System Sans (legacy)", "Compatibility fallback for the private HUD font"),
+    KENNEY_FUTURE("Kenney Future", "Sci-Fi pack display"),
+    KENNEY_FUTURE_NARROW("Kenney Future Narrow", "Compact HUD labels"),
+    SYSTEM_SANS("System Sans", "Best Unicode metadata coverage"),
+    SYSTEM_MONO("System Mono", "Technical terminal look")
+}
+
+val KenneyFuture = FontFamily(
+    Font(R.font.kenney_future, FontWeight.Normal)
+)
+
+val KenneyFutureNarrow = FontFamily(
+    Font(R.font.kenney_future_narrow, FontWeight.Normal)
+)
+
+// Preserve the saved preference identifier without redistributing the private font.
+val E1d1cText: FontFamily = FontFamily.SansSerif
+
+fun fontFamilyFor(option: HudFontOption): FontFamily = when (option) {
+    HudFontOption.E1D1C_TEXT -> E1d1cText
+    HudFontOption.KENNEY_FUTURE -> KenneyFuture
+    HudFontOption.KENNEY_FUTURE_NARROW -> KenneyFutureNarrow
+    HudFontOption.SYSTEM_SANS -> FontFamily.SansSerif
+    HudFontOption.SYSTEM_MONO -> FontFamily.Monospace
+}
+
+/** User-selected HUD font (Settings → Display → HUD Font). */
+val LocalHudFont = staticCompositionLocalOf { E1d1cText }
+
+/**
+ * App body / controls font — same as [LocalHudFont] so the font picker
+ * applies consistently across every screen.
+ */
+val LocalBodyFont = staticCompositionLocalOf { E1d1cText }
+
+@Composable
+fun hudFont(): FontFamily = LocalHudFont.current
+
+@Composable
+fun bodyFont(): FontFamily = LocalBodyFont.current

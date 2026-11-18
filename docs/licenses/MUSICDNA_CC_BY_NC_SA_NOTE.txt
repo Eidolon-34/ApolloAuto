@@ -1,0 +1,17 @@
+MusicDNA provenance and public-export exclusions
+================================================
+Upstream: https://github.com/harjot-oberai/MusicDNA
+License: https://github.com/harjot-oberai/MusicDNA/blob/master/LICENSE.md
+Upstream identifies its license as CC BY-NC-SA 4.0.
+
+The private radio candidate contained MusicDnaPortScenes.kt, whose source
+comment identifies an adaptation of HomeActivity.updatePoints. Earlier notices
+incorrectly described all DNA scenes as original. That adapted spiral renderer
+is EXCLUDED from this public snapshot, rather than relicensed as Apache-2.0.
+The old DNA_SPIRAL preference identifier now falls back to the Apollo helix.
+
+DnaBeatScenes.kt describes the retained HELIX and STRAND geometry as original
+Apollo implementations inspired by the general waveform aesthetic, not ports.
+SourcedVisualizerScenes.kt similarly identifies the retained circle as original
+geometry. Upstream attribution is retained for aesthetic inspiration, not as a
+claim of endorsement. No MusicDNA source or spiral port is included here.

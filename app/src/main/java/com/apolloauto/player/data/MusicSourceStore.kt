@@ -1,0 +1,532 @@
+package com.apolloauto.player.data
+
+import android.content.Context
+import android.net.Uri
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
+
+/**
+ * Persists multiple music roots and merges their catalogs into [LibraryStore].
+ * Migrates legacy single USB tree + PHONE/USB exclusive source mode.
+ */
+class MusicSourceStore(
+    context: Context,
+    private val libraryStore: LibraryStore,
+    private val firstSeenStore: TrackFirstSeenStore
+) {
+    private val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+    private val catalogCache = LibraryCatalogCache(context)
+    private val previewBySource = linkedMapOf<String, List<Track>>()
+    private val tracksBySource = linkedMapOf<String, List<Track>>()
+    private val playlistFilesBySource = linkedMapOf<String, List<DiscoveredPlaylistFile>>()
+
+    private val _sources = MutableStateFlow<List<MusicSource>>(emptyList())
+    val sources: StateFlow<List<MusicSource>> = _sources.asStateFlow()
+
+    private val _filter = MutableStateFlow(LibraryFilterState())
+    val filter: StateFlow<LibraryFilterState> = _filter.asStateFlow()
+
+    private val _scanErrors = MutableStateFlow<Map<String, String>>(emptyMap())
+    val scanErrors: StateFlow<Map<String, String>> = _scanErrors.asStateFlow()
+
+    init {
+        // Must assign _sources before any persist() — loadOrMigrate may write prefs.
+        persist(loadOrMigrate())
+        // Restore last known catalogs immediately so the library is not empty until rescan.
+        catalogCache.loadAll(_sources.value.map { it.id }).forEach { (id, tracks) ->
+            tracksBySource[id] = sanitizeSourceTracks(id, tracks)
+        }
+        // If a SAF phone folder is already enabled, keep MediaStore off (no ringtones mix-in).
+        if (_sources.value.any { it.enabled && it.kind == MusicSourceKind.PHONE_FOLDER }) {
+            useExclusivePhoneFolder(
+                preferredFolderId = _sources.value.first { it.enabled && it.kind == MusicSourceKind.PHONE_FOLDER }.id
+            )
+        } else {
+            publishMerged()
+        }
+    }
+
+    /**
+     * Prefer the selected phone folder, but **keep MediaStore enabled** as a backup.
+     * MediaStore already excludes ringtones/notifications; disabling it left users with
+     * an empty library when SAF folder permission/scan failed.
+     */
+    fun useExclusivePhoneFolder(preferredFolderId: String) {
+        val next = _sources.value.map { s ->
+            when {
+                s.id == preferredFolderId -> s.copy(enabled = true, preferred = true)
+                s.id == PHONE_MEDIASTORE_ID -> s.copy(enabled = true, preferred = false)
+                s.kind == MusicSourceKind.PHONE_FOLDER -> s.copy(enabled = false, preferred = false)
+                else -> s.copy(preferred = false)
+            }
+        }
+        persist(next)
+        _sources.value
+            .filter { it.kind == MusicSourceKind.PHONE_FOLDER && it.id != preferredFolderId }
+            .forEach { tracksBySource.remove(it.id) }
+        publishMerged()
+    }
+
+    /** Ensure the MediaStore source exists and is enabled (idempotent). */
+    fun ensureMediastoreEnabled() {
+        val list = _sources.value.toMutableList()
+        val idx = list.indexOfFirst { it.id == PHONE_MEDIASTORE_ID }
+        if (idx < 0) {
+            list.add(
+                0,
+                MusicSource(
+                    id = PHONE_MEDIASTORE_ID,
+                    kind = MusicSourceKind.PHONE_MEDIASTORE,
+                    label = defaultLabel(MusicSourceKind.PHONE_MEDIASTORE),
+                    enabled = true,
+                    preferred = list.none { it.preferred }
+                )
+            )
+        } else if (!list[idx].enabled) {
+            list[idx] = list[idx].copy(enabled = true)
+        } else {
+            return
+        }
+        persist(list)
+    }
+
+    fun phoneMediastore(): MusicSource =
+        _sources.value.find { it.id == PHONE_MEDIASTORE_ID }
+            ?: MusicSource(
+                id = PHONE_MEDIASTORE_ID,
+                kind = MusicSourceKind.PHONE_MEDIASTORE,
+                label = "Phone library",
+                preferred = true
+            )
+
+    fun setFilter(state: LibraryFilterState) {
+        _filter.value = state
+        publishMerged()
+    }
+
+    fun rename(id: String, label: String) {
+        update(id) { it.copy(label = label.ifBlank { it.label }) }
+    }
+
+    fun setEnabled(id: String, enabled: Boolean) {
+        update(id) { it.copy(enabled = enabled) }
+        if (!enabled) {
+            // Keep disk cache so re-enabling restores tracks without a full rescan.
+            tracksBySource.remove(id)
+            publishMerged()
+        } else if (!tracksBySource.containsKey(id)) {
+            val cached = catalogCache.load(id)
+            if (cached.isNotEmpty()) {
+                tracksBySource[id] = cached
+                publishMerged()
+            }
+        }
+    }
+
+    fun setPreferred(id: String) {
+        persist(
+            _sources.value.map {
+                it.copy(preferred = it.id == id)
+            }
+        )
+    }
+
+    fun removeSource(id: String) {
+        if (id == PHONE_MEDIASTORE_ID) {
+            // Keep MediaStore root; just clear its tracks if disabled.
+            setEnabled(id, false)
+            return
+        }
+        tracksBySource.remove(id)
+        playlistFilesBySource.remove(id)
+        catalogCache.remove(id)
+        persist(_sources.value.filterNot { it.id == id })
+        publishMerged()
+    }
+
+    fun upsertSafSource(
+        treeUri: Uri,
+        kind: MusicSourceKind,
+        label: String,
+        makePreferred: Boolean = false
+    ): MusicSource {
+        val uriStr = treeUri.toString()
+        val existing = _sources.value.find { it.treeUri == uriStr }
+        if (existing != null) {
+            val updated = existing.copy(
+                kind = kind,
+                label = label.ifBlank { existing.label },
+                enabled = true,
+                connected = true,
+                preferred = makePreferred || existing.preferred
+            )
+            persist(
+                _sources.value.map {
+                    when {
+                        it.id == existing.id -> updated
+                        makePreferred -> it.copy(preferred = false)
+                        else -> it
+                    }
+                }
+            )
+            return updated
+        }
+        val created = MusicSource(
+            id = "src_${System.currentTimeMillis()}",
+            kind = kind,
+            label = label.ifBlank { defaultLabel(kind) },
+            treeUri = uriStr,
+            enabled = true,
+            preferred = makePreferred,
+            connected = true
+        )
+        persist(
+            _sources.value.map { if (makePreferred) it.copy(preferred = false) else it } + created
+        )
+        // Legacy mirror for older UI paths
+        if (kind == MusicSourceKind.USB_SSD) {
+            libraryStore.setTreeUri(treeUri)
+        }
+        return created
+    }
+
+    /** Memory-only preview: additive, never removes the last complete catalog. */
+    fun previewScan(sourceId: String, discovered: List<Track>) {
+        val existing = tracksBySource[sourceId].orEmpty().associateBy { it.id }
+        previewBySource[sourceId] = mergeScanPreview(existing.values.toList(), sanitizeSourceTracks(sourceId, discovered)
+            .map { track -> existing[track.id]?.let { old ->
+                if (track.artworkUri == null) track.copy(artworkUri = old.artworkUri) else track
+            } ?: track }) { it.id }
+        publishMerged(noteFirstSeen = false)
+    }
+
+    fun clearScanPreview(sourceId: String) {
+        if (previewBySource.remove(sourceId) != null) publishMerged(noteFirstSeen = false)
+    }
+
+    fun recordScanResult(
+        sourceId: String,
+        tracks: List<Track>,
+        playlistFiles: List<DiscoveredPlaylistFile> = emptyList(),
+        error: String? = null,
+        connected: Boolean = true
+    ) {
+        val cleaned = sanitizeSourceTracks(sourceId, tracks)
+        // Keep previously enriched covers when a fast rescan omits embedded art.
+        val previousArt = tracksBySource[sourceId].orEmpty()
+            .mapNotNull { t -> t.artworkUri?.let { uri -> t.id to uri } }
+            .toMap()
+        val merged = if (previousArt.isEmpty()) {
+            cleaned
+        } else {
+            cleaned.map { t ->
+                if (t.artworkUri != null) t
+                else previousArt[t.id]?.let { t.copy(artworkUri = it) } ?: t
+            }
+        }
+        previewBySource.remove(sourceId)
+        tracksBySource[sourceId] = merged
+        playlistFilesBySource[sourceId] = playlistFiles
+        catalogCache.save(sourceId, merged)
+        firstSeenStore.noteSeen(merged.map { it.id })
+        val errMap = _scanErrors.value.toMutableMap()
+        if (error.isNullOrBlank()) errMap.remove(sourceId) else errMap[sourceId] = error
+        _scanErrors.value = errMap
+        update(sourceId) {
+            it.copy(
+                trackCount = merged.size,
+                playlistCount = playlistFiles.size,
+                lastScanMs = System.currentTimeMillis(),
+                lastError = error,
+                connected = connected
+            )
+        }
+        publishMerged()
+    }
+
+    /**
+     * Marks a source scan failed without wiping the last good catalog.
+     * Failed SAF/permission rescans used to replace tracks with [] and empty the library.
+     */
+    fun recordScanFailure(sourceId: String, error: String, connected: Boolean = false) {
+        val kept = tracksBySource[sourceId]
+            ?: catalogCache.load(sourceId).also { if (it.isNotEmpty()) tracksBySource[sourceId] = it }
+        val errMap = _scanErrors.value.toMutableMap()
+        errMap[sourceId] = error
+        _scanErrors.value = errMap
+        update(sourceId) {
+            it.copy(
+                trackCount = if (kept.isNotEmpty()) kept.size else it.trackCount,
+                lastScanMs = System.currentTimeMillis(),
+                lastError = error,
+                connected = connected
+            )
+        }
+        publishMerged()
+    }
+
+    fun discoveredPlaylists(): List<DiscoveredPlaylistFile> =
+        playlistFilesBySource.values.flatten()
+
+    fun tracksForSource(sourceId: String): List<Track> =
+        tracksBySource[sourceId].orEmpty()
+
+    /**
+     * Apply artwork URIs discovered by [AlbumArtEnricher] without a full rescan.
+     * Keys are track ids; unknown ids are ignored.
+     */
+    fun applyArtworkUpdates(artworkByTrackId: Map<String, Uri>) {
+        if (artworkByTrackId.isEmpty()) return
+        var changed = false
+        for ((sourceId, tracks) in tracksBySource.toMap()) {
+            var sourceChanged = false
+            val next = tracks.map { t ->
+                val art = artworkByTrackId[t.id] ?: return@map t
+                if (t.artworkUri == art) return@map t
+                sourceChanged = true
+                t.copy(artworkUri = art)
+            }
+            if (sourceChanged) {
+                tracksBySource[sourceId] = next
+                catalogCache.save(sourceId, next)
+                changed = true
+            }
+        }
+        if (changed) publishMerged()
+    }
+
+    /**
+     * Drop cached `file://…/album_art/…` URIs after an art-cache migration so the next
+     * library scan re-extracts unique covers (fixes colliding SAF emb_*.jpg keys).
+     */
+    fun invalidateCachedFileArtwork() {
+        var changed = false
+        for ((sourceId, tracks) in tracksBySource.toMap()) {
+            var sourceChanged = false
+            val next = tracks.map { t ->
+                val uri = t.artworkUri?.toString().orEmpty()
+                if (uri.startsWith("file:") && uri.contains("/album_art/")) {
+                    sourceChanged = true
+                    t.copy(artworkUri = null)
+                } else {
+                    t
+                }
+            }
+            if (sourceChanged) {
+                tracksBySource[sourceId] = next
+                catalogCache.save(sourceId, next)
+                changed = true
+            }
+        }
+        if (changed) publishMerged()
+    }
+
+    fun markDisconnected(sourceId: String) {
+        val existing = tracksBySource[sourceId].orEmpty().map { it.copy(available = false) }
+        tracksBySource[sourceId] = existing
+        update(sourceId) { it.copy(connected = false) }
+        publishMerged()
+    }
+
+    fun filteredTracks(): List<Track> {
+        val all = libraryStore.tracks.value
+        val f = _filter.value
+        return when (f.mode) {
+            LibraryFilter.ALL -> all
+            LibraryFilter.PHONE -> all.filter {
+                it.sourceKind == MusicSourceKind.PHONE_MEDIASTORE ||
+                    it.sourceKind == MusicSourceKind.PHONE_FOLDER
+            }
+            LibraryFilter.USB -> all.filter { it.sourceKind == MusicSourceKind.USB_SSD }
+            LibraryFilter.SD -> all.filter { it.sourceKind == MusicSourceKind.SD_CARD }
+            LibraryFilter.SOURCE -> all.filter { it.sourceId == f.sourceId }
+        }
+    }
+
+    private fun publishMerged(noteFirstSeen: Boolean = true) {
+        val enabledIds = _sources.value.filter { it.enabled }.map { it.id }.toSet()
+        val merged = (tracksBySource + previewBySource)
+            .filterKeys { it in enabledIds }
+            .values
+            .flatten()
+            .distinctBy { it.id }
+        if (noteFirstSeen) firstSeenStore.noteSeen(merged.map { it.id })
+        libraryStore.setTracks(merged)
+        val preferred = _sources.value.find { it.preferred && it.enabled }
+            ?: _sources.value.find { it.enabled }
+        when (preferred?.kind) {
+            MusicSourceKind.USB_SSD -> {
+                libraryStore.setSource(LibrarySource.USB)
+                preferred.treeUri?.let { libraryStore.setTreeUri(Uri.parse(it)) }
+            }
+            else -> libraryStore.setSource(LibrarySource.PHONE)
+        }
+        val total = merged.size
+        val online = _sources.value.count { it.enabled && it.connected }
+        libraryStore.setStatus("$total tracks · $online source(s) online")
+    }
+
+    private fun update(id: String, transform: (MusicSource) -> MusicSource) {
+        persist(_sources.value.map { if (it.id == id) transform(it) else it })
+    }
+
+    private fun persist(list: List<MusicSource>) {
+        val normalized = normalize(list)
+        _sources.value = normalized
+        writePrefs(normalized)
+    }
+
+    private fun normalize(list: List<MusicSource>): List<MusicSource> {
+        val hasPhone = list.any { it.id == PHONE_MEDIASTORE_ID }
+        val base = if (hasPhone) list else {
+            listOf(
+                MusicSource(
+                    id = PHONE_MEDIASTORE_ID,
+                    kind = MusicSourceKind.PHONE_MEDIASTORE,
+                    label = "Phone library",
+                    preferred = list.none { it.preferred },
+                    enabled = true
+                )
+            ) + list
+        }
+        val preferredCount = base.count { it.preferred }
+        return if (preferredCount == 1) base
+        else base.mapIndexed { index, s ->
+            s.copy(preferred = if (preferredCount == 0) s.id == PHONE_MEDIASTORE_ID else index == base.indexOfFirst { it.preferred })
+        }
+    }
+
+    private fun loadOrMigrate(): List<MusicSource> {
+        val raw = prefs.getString(KEY_SOURCES, null)
+        if (raw != null) {
+            return normalize(parse(raw))
+        }
+        // Migrate legacy LibraryStore single USB tree.
+        val legacyTree = libraryStore.treeUri.value?.toString()
+        val legacySource = libraryStore.source.value
+        val phone = MusicSource(
+            id = PHONE_MEDIASTORE_ID,
+            kind = MusicSourceKind.PHONE_MEDIASTORE,
+            label = "Phone library",
+            preferred = legacySource != LibrarySource.USB || legacyTree == null,
+            enabled = true
+        )
+        val usb = if (legacyTree != null) {
+            MusicSource(
+                id = "src_legacy_usb",
+                kind = MusicSourceKind.USB_SSD,
+                label = "USB SSD",
+                treeUri = legacyTree,
+                preferred = legacySource == LibrarySource.USB,
+                enabled = true,
+                connected = true
+            )
+        } else null
+        val migrated = normalize(listOfNotNull(phone, usb))
+        // Write prefs here without touching _sources (still initializing).
+        writePrefs(migrated)
+        return migrated
+    }
+
+    private fun writePrefs(list: List<MusicSource>) {
+        val arr = JSONArray()
+        list.forEach { s ->
+            arr.put(
+                JSONObject()
+                    .put("id", s.id)
+                    .put("kind", s.kind.name)
+                    .put("label", s.label)
+                    .put("treeUri", s.treeUri)
+                    .put("enabled", s.enabled)
+                    .put("preferred", s.preferred)
+                    .put("trackCount", s.trackCount)
+                    .put("playlistCount", s.playlistCount)
+                    .put("lastScanMs", s.lastScanMs)
+                    .put("lastError", s.lastError)
+                    .put("connected", s.connected)
+            )
+        }
+        prefs.edit().putString(KEY_SOURCES, arr.toString()).apply()
+    }
+
+    private fun parse(raw: String): List<MusicSource> = runCatching {
+        val arr = JSONArray(raw)
+        buildList {
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                add(
+                    MusicSource(
+                        id = o.getString("id"),
+                        kind = runCatching { MusicSourceKind.valueOf(o.getString("kind")) }
+                            .getOrDefault(MusicSourceKind.OTHER),
+                        label = o.optString("label", "Library"),
+                        treeUri = o.optString("treeUri").takeIf { it.isNotBlank() && it != "null" },
+                        enabled = o.optBoolean("enabled", true),
+                        preferred = o.optBoolean("preferred", false),
+                        trackCount = o.optInt("trackCount", 0),
+                        playlistCount = o.optInt("playlistCount", 0),
+                        lastScanMs = o.optLong("lastScanMs", 0L),
+                        lastError = o.optString("lastError").takeIf { it.isNotBlank() && it != "null" },
+                        connected = o.optBoolean("connected", true)
+                    )
+                )
+            }
+        }
+    }.getOrDefault(emptyList())
+
+    /** Drop OEM ringtone/notification clips that MediaStore mis-tags as music. */
+    private fun sanitizeSourceTracks(sourceId: String, tracks: List<Track>): List<Track> {
+        if (sourceId != PHONE_MEDIASTORE_ID &&
+            tracks.none { it.sourceKind == MusicSourceKind.PHONE_MEDIASTORE }
+        ) {
+            return tracks
+        }
+        return tracks.filter { track ->
+            if (track.sourceKind != MusicSourceKind.PHONE_MEDIASTORE &&
+                track.sourceId != PHONE_MEDIASTORE_ID
+            ) {
+                return@filter true
+            }
+            MediaStoreMusicFilter.isLikelyMusic(
+                relativePath = track.relativePath,
+                bucketDisplayName = track.folder,
+                displayName = null,
+                title = track.title,
+                durationMs = track.durationMs
+            )
+        }
+    }
+
+    companion object {
+        const val PHONE_MEDIASTORE_ID = "phone_mediastore"
+        private const val PREFS = "apollo_music_sources"
+        private const val KEY_SOURCES = "sources_json"
+
+        fun defaultLabel(kind: MusicSourceKind): String = when (kind) {
+            MusicSourceKind.PHONE_MEDIASTORE -> "All device media (MediaStore)"
+            MusicSourceKind.PHONE_FOLDER -> "Phone folder"
+            MusicSourceKind.USB_SSD -> "USB SSD"
+            MusicSourceKind.SD_CARD -> "SD Card"
+            MusicSourceKind.OTHER -> "Music folder"
+        }
+
+        fun inferKindFromDisplayName(name: String?): MusicSourceKind {
+            val n = name?.lowercase().orEmpty()
+            return when {
+                n.contains("sd") || n.contains("card") -> MusicSourceKind.SD_CARD
+                n.contains("usb") || n.contains("otg") || n.contains("portable") -> MusicSourceKind.USB_SSD
+                else -> MusicSourceKind.PHONE_FOLDER
+            }
+        }
+    }
+}
+
+data class DiscoveredPlaylistFile(
+    val sourceId: String,
+    val name: String,
+    val uri: Uri,
+    val relativePath: String
+)
